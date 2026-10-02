@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { songs } from '../data/songs'
+import { checkAudioSupport, describeAudioError, logAudioError } from '../utils/audioDebug'
 
 const MusicStateContext = createContext(null)
 const MusicTimeContext = createContext(null)
@@ -17,6 +18,8 @@ export function MusicProvider({ children }) {
   const shuffleRef = useRef(false)
   const repeatRef = useRef('off')
   const isTransitioningRef = useRef(false)
+  const songsRef = useRef(songs)
+  songsRef.current = songs
 
   const [currentSong, setCurrentSong] = useState(null)
   const [isPlaying, setIsPlaying] = useState(false)
@@ -25,11 +28,17 @@ export function MusicProvider({ children }) {
   const [shuffle, setShuffle] = useState(() => readStored('dilyorbek-shuffle', 'false') === 'true')
   const [repeat, setRepeat] = useState(() => readStored('dilyorbek-repeat', 'off'))
   const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  /** songId -> duration (metadata orqali to'ldiriladi, MusicCard buni o'zi yaratmaydi) */
+  const [durations, setDurations] = useState({})
   // Time lives in its own context value so ~4Hz timeupdate ticks never re-render
   // components that only care about song/controls state.
   const [time, setTime] = useState({ currentTime: 0, duration: 0 })
 
-  const play = () => audioRef.current?.play().catch(() => { /* autoplay/policy errors surface via onError */ })
+  const play = () => audioRef.current?.play().catch(error => {
+    if (error?.name === 'AbortError') return
+    logAudioError({ url: audioRef.current?.currentSrc || audioRef.current?.src, error, audio: audioRef.current })
+  })
 
   // Load a new source. Called only when the song identity changes.
   useEffect(() => {
@@ -38,9 +47,10 @@ export function MusicProvider({ children }) {
     songRef.current = currentSong
     isTransitioningRef.current = true
     setError('')
+    setLoading(true)
     setTime({ currentTime: 0, duration: 0 })
-    audio.src = currentSong.audio
-    audio.load()
+    audio.src = currentSong.src
+    audio.load() // Safari uchun majburiy
     play().finally(() => { isTransitioningRef.current = false })
   }, [currentSong])
 
@@ -53,11 +63,45 @@ export function MusicProvider({ children }) {
   useEffect(() => { try { localStorage.setItem('dilyorbek-shuffle', String(shuffle)) } catch { /* storage optional */ } }, [shuffle])
   useEffect(() => { try { localStorage.setItem('dilyorbek-repeat', repeat) } catch { /* storage optional */ } }, [repeat])
 
+  // Markaziy durations cache: har bir komponent o'z `new Audio()` yaratmaydi.
+  useEffect(() => {
+    if (checkAudioSupport().ok !== true) return undefined
+    let cancelled = false
+    const probes = songs.map(song => {
+      const probe = new Audio()
+      probe.preload = 'metadata'
+      const release = () => { probe.removeAttribute('src'); probe.load() }
+      const store = value => {
+        if (cancelled) return
+        release()
+        setDurations(previous => (previous[song.id] === value ? previous : { ...previous, [song.id]: value }))
+      }
+      const onMeta = () => { if (Number.isFinite(probe.duration) && probe.duration > 0) store(probe.duration) }
+      const onFail = () => {
+        if (import.meta.env.DEV) console.warn(`[Music] Metadata yuklanmadi: ${song.src}`)
+        store(0)
+      }
+      probe.addEventListener('loadedmetadata', onMeta, { once: true })
+      probe.addEventListener('error', onFail, { once: true })
+      probe.src = song.src
+      return { probe, onMeta, onFail, release }
+    })
+    return () => {
+      cancelled = true
+      probes.forEach(({ probe, onMeta, onFail, release }) => {
+        probe.removeEventListener('loadedmetadata', onMeta)
+        probe.removeEventListener('error', onFail)
+        release()
+      })
+    }
+  }, [])
+
   const seek = seconds => {
     const audio = audioRef.current
     if (!audio || !Number.isFinite(seconds)) return
-    const clamped = Math.max(0, Math.min(seconds, audio.duration || seconds))
-    audio.currentTime = clamped
+    const known = Number.isFinite(audio.duration) ? audio.duration : 0
+    const clamped = Math.max(0, Math.min(seconds, known || seconds))
+    try { audio.currentTime = clamped } catch { return }
     setTime(previous => ({ ...previous, currentTime: clamped }))
   }
 
@@ -105,34 +149,58 @@ export function MusicProvider({ children }) {
 
   const handleEnded = () => {
     if (repeatRef.current === 'one') { seek(0); play(); return }
-    const index = songs.findIndex(song => song.id === songRef.current?.id)
-    if (repeatRef.current === 'off' && index === songs.length - 1) { setIsPlaying(false); return }
+    const list = songsRef.current
+    const index = list.findIndex(song => song.id === songRef.current?.id)
+    if (repeatRef.current === 'off' && index === list.length - 1) { setIsPlaying(false); setLoading(false); return }
     nextSong()
   }
 
   // Audio events are attached once, in code, with real cleanup — no <audio> in JSX.
   useEffect(() => {
     const audio = audioRef.current
+    const cacheDuration = () => {
+      const song = songRef.current
+      if (!song) return
+      const value = Number.isFinite(audio.duration) ? audio.duration : 0
+      if (value > 0) setDurations(previous => (previous[song.id] === value ? previous : { ...previous, [song.id]: value }))
+    }
     const onTime = () => setTime(previous => ({ ...previous, currentTime: audio.currentTime }))
-    const onMeta = () => setTime({ currentTime: audio.currentTime, duration: Number.isFinite(audio.duration) ? audio.duration : 0 })
+    const onMeta = () => { cacheDuration(); setTime({ currentTime: audio.currentTime, duration: Number.isFinite(audio.duration) ? audio.duration : 0 }) }
     const onEnded = () => handleEnded()
     const onPlay = () => setIsPlaying(true)
     const onPause = () => setIsPlaying(false)
-    const onError = () => { setIsPlaying(false); setError('Unable to play this song') }
+    const onPlaying = () => { setLoading(false); setError(''); setIsPlaying(true) }
+    const onCanPlay = () => setLoading(false)
+    const onWaiting = () => setLoading(true)
+    const onStalled = () => { if (import.meta.env.DEV) console.warn('[Music] Stream stalled:', audio.currentSrc) }
+    const onError = () => {
+      setIsPlaying(false)
+      setLoading(false)
+      const url = audio.currentSrc || audio.src
+      logAudioError({ url, audio })
+      const detail = describeAudioError(audio)
+      setError(`Unable to play this song.${detail ? ` ${detail}` : ''}`)
+    }
     audio.addEventListener('timeupdate', onTime)
     audio.addEventListener('loadedmetadata', onMeta)
-    audio.addEventListener('loadeddata', onMeta)
+    audio.addEventListener('canplay', onCanPlay)
     audio.addEventListener('ended', onEnded)
     audio.addEventListener('play', onPlay)
+    audio.addEventListener('playing', onPlaying)
     audio.addEventListener('pause', onPause)
+    audio.addEventListener('waiting', onWaiting)
+    audio.addEventListener('stalled', onStalled)
     audio.addEventListener('error', onError)
     return () => {
       audio.removeEventListener('timeupdate', onTime)
       audio.removeEventListener('loadedmetadata', onMeta)
-      audio.removeEventListener('loadeddata', onMeta)
+      audio.removeEventListener('canplay', onCanPlay)
       audio.removeEventListener('ended', onEnded)
       audio.removeEventListener('play', onPlay)
+      audio.removeEventListener('playing', onPlaying)
       audio.removeEventListener('pause', onPause)
+      audio.removeEventListener('waiting', onWaiting)
+      audio.removeEventListener('stalled', onStalled)
       audio.removeEventListener('error', onError)
     }
   }, [])
@@ -170,7 +238,7 @@ export function MusicProvider({ children }) {
     audio.load()
   }, [])
 
-  const stateValue = { currentSong, isPlaying, playlist: songs, volume, isMuted, shuffle, repeat, error, playSong, togglePlay, nextSong, previousSong, toggleShuffle, toggleRepeat, toggleMute, setVolume }
+  const stateValue = { currentSong, isPlaying, playlist: songs, durations, volume, isMuted, shuffle, repeat, error, loading, playSong, togglePlay, nextSong, previousSong, toggleShuffle, toggleRepeat, toggleMute, setVolume }
   const timeValue = { ...time, seek }
 
   return (

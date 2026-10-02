@@ -1,3 +1,5 @@
+import { imagePath } from '../config/media'
+
 // All personal details can be changed here to adapt the site for someone else.
 export const profile = {
   name: 'Dilyorbek',
@@ -11,5 +13,5 @@ export const profile = {
   telegramChannel: '@dilyorbek_chanel',
   description: 'A winter soul, finding beauty in the little moments.',
   about: 'A little space for the things that feel like me — quiet winter days, meaningful connections, and music worth keeping close. Currently writing my own story, one chapter at a time.',
-  avatar: '/media/dilyorbek.jpg',
+  avatar: imagePath('dilyorbek.jpg'),
 }
